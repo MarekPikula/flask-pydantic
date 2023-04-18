@@ -1,5 +1,6 @@
 import inspect
 from collections.abc import Iterable
+from dataclasses import is_dataclass
 from functools import wraps
 from typing import (
     TYPE_CHECKING,
@@ -30,6 +31,12 @@ from pydantic import BaseModel, ValidationError
 from pydantic.tools import parse_obj_as
 
 from .converters import convert_query_params
+from .dictable_common import (
+    DictableModel,
+    DictableModelTuple,
+    DictableProtocol,
+    make_json_from_model,
+)
 from .exceptions import (
     InvalidIterableOfModelsException,
     JsonBodyParsingError,
@@ -41,7 +48,7 @@ if TYPE_CHECKING:
     from pydantic.error_wrappers import ErrorDict
 
 
-ModelResponseReturnValue = Union[ResponseReturnValue, BaseModel]
+ModelResponseReturnValue = Union[ResponseReturnValue, DictableModel]
 ModelRouteCallable = Union[
     Callable[..., ModelResponseReturnValue],
     Callable[..., Awaitable[ModelResponseReturnValue]],
@@ -49,23 +56,20 @@ ModelRouteCallable = Union[
 
 
 def make_json_response(
-    content: "Union[BaseModel, Iterable[BaseModel]]",
+    content: "Union[DictableModel, Iterable[DictableModel]]",
     status_code: int,
     by_alias: bool,
     exclude_none: bool = False,
 ) -> Response:
     """serializes model, creates JSON response with given status code"""
-    if not isinstance(content, BaseModel):
+    if isinstance(content, Iterable) and not isinstance(content, BaseModel):
         js = "["
         js += ", ".join(
-            [
-                model.json(exclude_none=exclude_none, by_alias=by_alias)
-                for model in content
-            ]
+            [make_json_from_model(model, by_alias, exclude_none) for model in content]
         )
         js += "]"
     else:
-        js = content.json(exclude_none=exclude_none, by_alias=by_alias)
+        js = make_json_from_model(content, by_alias, exclude_none)
     response = make_response(js, status_code)
     response.mimetype = "application/json"
     return response
@@ -81,14 +85,25 @@ def unsupported_media_type_response(request_cont_type: str) -> Response:
 
 def is_iterable_of_models(content: Any) -> bool:
     try:
-        return all(isinstance(obj, BaseModel) for obj in content)
+        return all(
+            is_dataclass(obj) or isinstance(obj, DictableModelTuple) for obj in content
+        )
     except TypeError:
         return False
 
 
-def validate_many_models(model: Type[BaseModel], content: Any) -> List[BaseModel]:
+def validate_many_models(
+    model: Type[DictableModel], content: Any
+) -> List[DictableModel]:
     try:
-        return [model(**fields) for fields in content]
+        return [
+            (
+                model.from_dict(fields)
+                if issubclass(model, DictableProtocol)
+                else model(**fields)
+            )
+            for fields in content
+        ]
     except TypeError:
         # iteration through `content` fails
         err: List["ErrorDict"] = [
@@ -149,9 +164,9 @@ def _get_type_generic(hint: Any):
 
 def _ensure_model_kwarg(
     kwarg_name: str,
-    from_validate: Optional[Type[BaseModel]],
+    from_validate: Optional[Type[DictableModel]],
     func: ModelRouteCallable,
-) -> Tuple[Optional[Type[BaseModel]], bool]:
+) -> Tuple[Optional[Type[DictableModel]], bool]:
     """Get model information either from wrapped function or validate kwargs."""
     func_spec = inspect.getfullargspec(func)
     in_func_arg = kwarg_name in func_spec.args or kwarg_name in func_spec.kwonlyargs
@@ -163,25 +178,25 @@ def _ensure_model_kwarg(
     if from_validate is None:
         return from_func, in_func_arg
     if issubclass(from_func, from_validate):
-        return from_func, in_func_arg
+        return from_func, in_func_arg  # type: ignore
     return from_validate, in_func_arg
 
 
 def validate(
-    body: Optional[Type[BaseModel]] = None,
-    query: Optional[Type[BaseModel]] = None,
+    body: Optional[Type[DictableModel]] = None,
+    query: Optional[Type[DictableModel]] = None,
     on_success_status: int = 200,
     exclude_none: bool = False,
     response_many: bool = False,
     request_body_many: bool = False,
     response_by_alias: bool = False,
     get_json_params: Optional[Dict[str, Any]] = None,
-    form: Optional[Type[BaseModel]] = None,
+    form: Optional[Type[DictableModel]] = None,
 ):
     """
     Decorator for route methods which will validate query, body and form parameters
     as well as serialize the response (if it derives from pydantic's BaseModel
-    class).
+    class, a dataclass or any class which impements from_dict() and to_dict()).
 
     Request parameters are accessible via flask's `request` variable:
         - request.query_params
@@ -241,7 +256,10 @@ def validate(
     def decorate(func: ModelRouteCallable) -> RouteCallable:
         @wraps(func)
         def wrapper(*args: Any, **kwargs: Dict[str, Any]) -> ResponseReturnValue:
-            q, b, f, err = None, None, None, FailedValidation()
+            q: Optional[DictableModel] = None
+            b: Optional[Union[DictableModel, List[DictableModel]]] = None
+            f: Optional[DictableModel] = None
+            err = FailedValidation()
             func_kwargs, path_err = validate_path_params(func, kwargs)
             if len(path_err) > 0:
                 err.path_params = path_err
@@ -249,17 +267,25 @@ def validate(
             if query_model is not None:
                 query_params = convert_query_params(request.args, query_model)
                 try:
-                    q = query_model(**query_params)
+                    if issubclass(query_model, DictableProtocol):
+                        q = query_model.from_dict(query_params)
+                    else:
+                        q = query_model(**query_params)
                 except ValidationError as ve:
                     err.query_params = ve.errors()
             body_model, body_in_kwargs = _ensure_model_kwarg("body", body, func)
             if body_model is not None:
                 body_params = get_body_dict(**(get_json_params or {}))
                 try:
-                    if "__root__" in body_model.__fields__:
+                    if (
+                        issubclass(body_model, BaseModel)
+                        and "__root__" in body_model.__fields__
+                    ):
                         b = body_model(__root__=body_params).__root__  # type: ignore
                     elif request_body_many:
                         b = validate_many_models(body_model, body_params)
+                    elif issubclass(body_model, DictableProtocol):
+                        b = body_model.from_dict(body_params)
                     else:
                         b = body_model(**body_params)
                 except (ValidationError, ManyModelValidationError) as error:
@@ -275,8 +301,13 @@ def validate(
             if form_model is not None:
                 form_params = request.form
                 try:
-                    if "__root__" in form_model.__fields__:
+                    if (
+                        issubclass(form_model, BaseModel)
+                        and "__root__" in form_model.__fields__
+                    ):
                         f = form_model(__root__=form_params).__root__  # type: ignore
+                    elif issubclass(form_model, DictableProtocol):
+                        f = form_model.from_dict(form_params)
                     else:
                         f = form_model(**form_params)
                 except TypeError as error:
@@ -325,7 +356,7 @@ def validate(
                     exclude_none=exclude_none,
                 )
 
-            if isinstance(res, BaseModel):
+            if is_dataclass(res) or isinstance(res, DictableModelTuple):
                 return make_json_response(
                     res,
                     on_success_status,
@@ -336,7 +367,7 @@ def validate(
             if (
                 isinstance(res, tuple)
                 and len(res) in [2, 3]
-                and isinstance(res[0], BaseModel)
+                and (is_dataclass(res[0]) or isinstance(res[0], DictableModelTuple))
             ):
                 headers: Optional[
                     Union[Dict[str, Any], Tuple[Any, ...], List[Any]]
